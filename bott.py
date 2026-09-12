@@ -1,6 +1,10 @@
 import os
 import html
 import re
+import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -1702,16 +1706,141 @@ async def process_expired_ads_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
+# 🌐 سرور HTTP برای Render + Webhook تلگرام
+# =========================================================
+
+PORT = int(os.environ.get("PORT", "10000"))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = "/telegram"
+
+
+def create_http_server(application, loop):
+    """
+    یک HTTP server بسیار سبک با کتابخانه‌های داخلی Python.
+    Render باید یک پورت HTTP باز ببیند؛ این سرور همان پورت را باز می‌کند.
+
+    روی Render:
+        Telegram -> HTTPS -> Render -> POST /telegram -> این برنامه -> PTB
+
+    بنابراین وقتی سرویس Free خواب باشد، درخواست webhook تلگرام می‌تواند
+    باعث بیدار شدن Web Service شود.
+    """
+
+    bot = application.bot
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status=200, body=b"OK", content_type="text/plain; charset=utf-8"):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            # Render/مرورگر برای health check می‌تواند این مسیر را صدا بزند.
+            if self.path == "/" or self.path == "/health":
+                self._send(200, b"Mr Beni Link is running.")
+            else:
+                self._send(404, b"Not Found")
+
+        def do_POST(self):
+            if self.path != WEBHOOK_PATH:
+                self._send(404, b"Not Found")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length <= 0:
+                    self._send(400, b"Bad Request")
+                    return
+
+                raw = self.rfile.read(content_length)
+                data = json.loads(raw.decode("utf-8"))
+
+                update = Update.de_json(data, bot)
+
+                # این callback از thread مربوط به HTTP server به event loop
+                # اصلی PTB منتقل می‌شود.
+                future = asyncio.run_coroutine_threadsafe(
+                    application.process_update(update),
+                    loop
+                )
+                future.result(timeout=30)
+
+                self._send(200, b"OK")
+
+            except Exception as e:
+                print(f"⚠️ Webhook error: {e}")
+                # به Telegram پاسخ HTTP می‌دهیم تا درخواست از نظر شبکه کامل شود.
+                # خطای داخلی را در لاگ Render ثبت می‌کنیم.
+                try:
+                    self._send(500, b"Internal Server Error")
+                except Exception:
+                    pass
+
+        def log_message(self, format, *args):
+            # لاگ‌های HTTP خیلی شلوغ نشوند.
+            print(f"🌐 HTTP: {format % args}")
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    return server
+
+
+async def run_render_webhook(app):
+    """
+    اجرای بات در حالت Webhook روی Render.
+    این حالت برای Free Web Service مناسب‌تر از polling است، چون
+    درخواست‌های Telegram به endpoint عمومی Render می‌رسند.
+    """
+
+    loop = asyncio.get_running_loop()
+
+    await app.initialize()
+    await app.start()
+
+    server = create_http_server(app, loop)
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
+    server_thread.start()
+
+    webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+
+    try:
+        await app.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=False
+        )
+
+        print("🌐 Render Webhook server is running...")
+        print(f"🔗 Webhook URL: {webhook_url}")
+        print(f"🔌 HTTP Port: {PORT}")
+        print("🤖 Mr Beni Link is running...")
+
+        # برنامه را زنده نگه می‌داریم.
+        await asyncio.Event().wait()
+
+    finally:
+        print("🛑 Stopping Render webhook...")
+
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+
+        server.shutdown()
+        server.server_close()
+
+        await app.stop()
+        await app.shutdown()
+
+
+# =========================================================
 # 🚀 اجرای ربات
 # =========================================================
 
-def main():
-    init_database()
-
-    if not TOKEN or TOKEN.startswith("توکن_"):
-        print("❌ ابتدا TOKEN را در bot.py وارد کن.")
-        return
-
+def build_application():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -1733,20 +1862,48 @@ def main():
 
     if app.job_queue is not None:
         # هر ۱۵ دقیقه دعوت‌هایی که ۲۴ ساعت از ثبتشان گذشته را بررسی کن
-        app.job_queue.run_repeating(process_pending_referrals_job, interval=900, first=15)
+        app.job_queue.run_repeating(
+            process_pending_referrals_job,
+            interval=900,
+            first=15
+        )
+
         # هر ۱۰ دقیقه تبلیغات منقضی‌شده را بررسی و جمع کن
-        app.job_queue.run_repeating(process_expired_ads_job, interval=600, first=30)
+        app.job_queue.run_repeating(
+            process_expired_ads_job,
+            interval=600,
+            first=30
+        )
     else:
         print(
             "⚠️ JobQueue فعال نیست. برای اجرای خودکار شرط ۲۴ ساعته و انقضای تبلیغ،\n"
             "این پکیج را نصب کن: pip install \"python-telegram-bot[job-queue]\""
         )
 
-    print("🤖 Mr Beni Link is running...")
+    return app
+
+
+def main():
+    init_database()
+
+    if not TOKEN or TOKEN.startswith("توکن_"):
+        print("❌ ابتدا BOT_TOKEN را در Environment Variables تنظیم کن.")
+        return
+
+    app = build_application()
+
     print(f"📣 Channel: {CHANNEL_USERNAME}")
     print("👑 Admin panel: /admin")
 
-    app.run_polling()
+    # روی Render از Webhook استفاده می‌کنیم.
+    # Render خودش RENDER_EXTERNAL_URL را در اختیار سرویس می‌گذارد.
+    if RENDER_EXTERNAL_URL:
+        print("☁️ Render detected → starting Telegram Webhook mode...")
+        asyncio.run(run_render_webhook(app))
+    else:
+        # اجرای محلی مثل قبل با polling انجام می‌شود.
+        print("💻 Local mode detected → starting polling...")
+        app.run_polling()
 
 
 if __name__ == "__main__":
